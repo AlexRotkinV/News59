@@ -4,6 +4,8 @@ import json
 import os
 import re
 import sqlite3
+import hashlib
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 from collections import deque
@@ -13,38 +15,37 @@ from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.exceptions import TelegramNetworkError
 from aiohttp import ClientTimeout, TCPConnector, web
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from groq import Groq
 
-# ========== НАСТРОЙКИ (из переменных окружения) ==========
+# ========== НАСТРОЙКИ ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-YOUR_CHAT_ID = int(os.getenv("YOUR_CHAT_ID", 992586773))  # можно задать через переменную окружения
+YOUR_CHAT_ID = int(os.getenv("YOUR_CHAT_ID", 0))
 
-# Проверка наличия обязательных переменных
 if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN не задан в переменных окружения!")
+    raise ValueError("❌ BOT_TOKEN не задан!")
 if not GROQ_API_KEY:
-    raise ValueError("❌ GROQ_API_KEY не задан в переменных окружения!")
+    raise ValueError("❌ GROQ_API_KEY не задан!")
+if not YOUR_CHAT_ID:
+    raise ValueError("❌ YOUR_CHAT_ID не задан!")
 
-# Настройки (можно тоже вынести в переменные окружения)
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", 300))  # 5 минут
-WINDOW_MINUTES = int(os.getenv("WINDOW_MINUTES", 10))
-POSTS_FETCH_LIMIT = int(os.getenv("POSTS_FETCH_LIMIT", 30))
-MAX_CONCURRENT_CHECKS = int(os.getenv("MAX_CONCURRENT_CHECKS", 3))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", 2))
+# Ключевые настройки
+CHECK_INTERVAL_SECONDS = 60    # ← проверка каждые 60 секунд
+WINDOW_MINUTES = 10            # посты за последние 10 минут
+POSTS_FETCH_LIMIT = 30
+MAX_CONCURRENT_CHECKS = 3
+MAX_RETRIES = 2
 
-# Определяем окружение
 IS_PRODUCTION = bool(os.environ.get('RENDER_EXTERNAL_HOSTNAME') or os.environ.get('BOTHOST_HOSTNAME'))
 
 # Инициализация Groq
 groq_client = Groq(api_key=GROQ_API_KEY)
 USE_AI = True
 
-# Список каналов (username без @)
+# Список каналов
 CHANNELS = [
     "minterbez_permkrai", "mud_no", "tass_agency", "mod_russia", "radarrussiia",
     "minprosrf", "permvkurse", "newskompanion", "uranews", "favt_info",
@@ -94,15 +95,23 @@ def init_db():
                  (channel TEXT, post_id TEXT, sent_at TIMESTAMP,
                  PRIMARY KEY (channel, post_id))''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_sent_at ON sent_posts (sent_at)')
+    c.execute('''CREATE TABLE IF NOT EXISTS daily_stats
+                 (date TEXT, channel TEXT, count INTEGER,
+                 PRIMARY KEY (date, channel))''')
     conn.commit()
     conn.close()
 
 def mark_as_sent(channel: str, post_id: str):
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
-    now = datetime.now(pytz.timezone('Asia/Yekaterinburg')).isoformat()
+    now_perm = datetime.now(pytz.timezone('Asia/Yekaterinburg'))
+    now_str = now_perm.isoformat()
+    today_str = now_perm.strftime("%Y-%m-%d")
+    
     c.execute("INSERT OR REPLACE INTO sent_posts (channel, post_id, sent_at) VALUES (?, ?, ?)",
-              (channel, post_id, now))
+              (channel, post_id, now_str))
+    c.execute("INSERT OR REPLACE INTO daily_stats (date, channel, count) VALUES (?, ?, COALESCE((SELECT count FROM daily_stats WHERE date = ? AND channel = ?), 0) + 1)",
+              (today_str, channel, today_str, channel))
     conn.commit()
     conn.close()
 
@@ -123,7 +132,16 @@ def cleanup_old_posts():
     conn.commit()
     conn.close()
     if deleted:
-        console_print(f"🧹 Очищено {deleted} старых записей из БД")
+        console_print(f"🧹 Очищено {deleted} старых записей")
+
+def get_today_stats():
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    today_str = datetime.now(pytz.timezone('Asia/Yekaterinburg')).strftime("%Y-%m-%d")
+    c.execute("SELECT channel, count FROM daily_stats WHERE date = ? ORDER BY count DESC", (today_str,))
+    result = c.fetchall()
+    conn.close()
+    return dict(result)
 
 init_db()
 
@@ -131,7 +149,7 @@ init_db()
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
 
 # ========== ЛОГИРОВАНИЕ ==========
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def console_print(msg):
@@ -175,6 +193,9 @@ def make_title_bold(text: str) -> str:
     lines[0] = first_line
     return '\n'.join(lines)
 
+def get_links():
+    return f"\n\n<a href='https://t.me/+JnuI5n4BRLtiNmUy'>Подписаться на Чё по Перми |</a> <a href='https://t.me/chvprm_admin'>Прислать новость</a>"
+
 # ========== КОНТРОЛЬ ЛИМИТОВ GROQ ==========
 class GroqRateLimiter:
     def __init__(self, max_per_minute=25, max_per_day=10000):
@@ -183,7 +204,7 @@ class GroqRateLimiter:
         self.minute_requests = deque()
         self.day_requests = deque()
         self.last_reset_day = datetime.now().date()
-        self.base_delay = 2
+        self.base_delay = 1
     
     def _cleanup(self):
         now = datetime.now()
@@ -204,7 +225,12 @@ class GroqRateLimiter:
             return False, max(wait, 1)
         if len(self.day_requests) >= self.max_per_day:
             return False, 3600
-        return True, self.base_delay
+        minute_usage = len(self.minute_requests) / self.max_per_minute
+        if minute_usage > 0.8:
+            delay = self.base_delay * (1 + minute_usage * 2)
+        else:
+            delay = self.base_delay
+        return True, delay
     
     def record_request(self):
         now = datetime.now()
@@ -217,7 +243,6 @@ cache = {}
 async def groq_generate_safe(prompt: str, temperature: float = 0.7, max_tokens: int = 600) -> Optional[str]:
     if not USE_AI:
         return None
-    import hashlib
     cache_key = hashlib.md5(prompt.lower().strip().encode()).hexdigest()
     if cache_key in cache:
         return cache[cache_key]
@@ -263,13 +288,12 @@ async def rate_post_interest(text):
 async def rewrite_post(text):
     if not USE_AI:
         return "❌ Нейросеть не настроена"
-    prompt = f"Перепиши новость в стиле пермских пабликов (коротко, 1-3 эмодзи, без выдумок):\n\n{text[:500]}"
+    prompt = f"""Перепиши новость в стиле пермских пабликов (коротко, 1-3 эмодзи, без выдумок):\n\n{text[:500]}"""
     result = await groq_generate_safe(prompt, temperature=0.8, max_tokens=500)
     if not result:
         return "⏸️ Лимит API"
     formatted = make_title_bold(result)
-    links = f"\n\n<a href='https://t.me/+JnuI5n4BRLtiNmUy'>Подписаться на Чё по Перми |</a> <a href='https://t.me/chvprm_admin'>Прислать новость</a>"
-    return formatted + links
+    return formatted + get_links()
 
 def to_perm_time(date_str):
     if not date_str:
@@ -289,6 +313,7 @@ def is_post_in_last_minutes(date_str):
     now_perm = datetime.now(pytz.timezone('Asia/Yekaterinburg'))
     return (now_perm - perm_dt).total_seconds() <= (WINDOW_MINUTES * 60)
 
+# ========== ПРОВЕРКА КАНАЛОВ ==========
 async def check_channel(channel: str):
     async with semaphore:
         url = f"https://t.me/s/{channel}"
@@ -299,7 +324,7 @@ async def check_channel(channel: str):
                 return
             soup = BeautifulSoup(r.text, 'lxml')
             messages = soup.find_all('div', class_='tgme_widget_message')[:POSTS_FETCH_LIMIT]
-            new_posts = []
+            
             for msg in messages:
                 post_id = msg.get('data-post', '')
                 time_elem = msg.find('time', class_='time')
@@ -310,25 +335,46 @@ async def check_channel(channel: str):
                     continue
                 text_elem = msg.find('div', class_='tgme_widget_message_text')
                 text = text_elem.get_text(strip=True)[:1000] if text_elem else "📄 Без текста"
-                new_posts.append({'post_id': post_id, 'text': text})
-            if not new_posts:
-                return
-            console_print(f"📨 {len(new_posts)} новых постов в @{channel}")
-            for post in new_posts:
+                
                 title = CHANNEL_NAMES.get(channel, channel)
-                rating = await rate_post_interest(post['text'])
-                msg_text = f"📢 <b>{title}</b>\n{rating}\n\n{post['text']}\n\n🔗 <a href='https://t.me/{post['post_id']}'>Читать пост</a>"
+                rating = await rate_post_interest(text)
+                msg_text = f"📢 <b>{title}</b>\n{rating}\n\n{text}\n\n🔗 <a href='https://t.me/{post_id}'>Читать пост</a>"
+                
                 await bot.send_message(YOUR_CHAT_ID, msg_text, parse_mode="HTML", 
-                                       reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Преобразовать", callback_data=f"rewrite_{post['post_id']}")]]))
-                mark_as_sent(channel, post['post_id'])
-                await asyncio.sleep(0.5)
+                                       reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Преобразовать", callback_data=f"rewrite_{post_id}")]]))
+                mark_as_sent(channel, post_id)
+                await asyncio.sleep(0.3)
         except Exception as e:
             console_print(f"❗ Ошибка @{channel}: {e}")
+
+async def background_checker():
+    while True:
+        cleanup_old_posts()
+        console_print(f"🔍 Проверка {len(CHANNELS)} каналов (посты за {WINDOW_MINUTES} мин)...")
+        tasks = [check_channel(ch) for ch in CHANNELS]
+        await asyncio.gather(*tasks)
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 # ========== БОТ ==========
 bot = None
 dp = Dispatcher()
 parsing_enabled = True
+user_messages_cache = {}
+
+class UserMessageCache:
+    def __init__(self):
+        self.data = {}
+    def add(self, original_text: str, file_id: Optional[str] = None):
+        key = str(uuid.uuid4())
+        self.data[key] = (original_text, file_id)
+        return key
+    def get(self, key: str):
+        return self.data.get(key, (None, None))
+    def remove(self, key: str):
+        if key in self.data:
+            del self.data[key]
+
+user_cache = UserMessageCache()
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
@@ -337,13 +383,15 @@ async def start_cmd(message: types.Message):
     await message.answer(
         f"🤖 <b>Парсер Telegram каналов + Groq</b>\n\n"
         f"📡 Каналов: {len(CHANNELS)}\n"
+        f"⏱ Проверка каждые {CHECK_INTERVAL_SECONDS} сек\n"
         f"🕒 Посты за последние {WINDOW_MINUTES} минут\n"
-        f"🧠 Оценка + кнопка «Преобразовать»\n\n"
+        f"🧠 Оценка + кнопка «Преобразовать»\n"
+        f"📸 Отправьте текст или фото — бот ответит с кнопкой\n\n"
         f"<b>Команды:</b>\n"
         f"/stop — остановить парсинг\n"
         f"/start — возобновить парсинг\n"
         f"/channels — список каналов\n"
-        f"/stats — статистика",
+        f"/stats — статистика за сегодня",
         parse_mode="HTML"
     )
 
@@ -355,43 +403,123 @@ async def stop_cmd(message: types.Message):
 
 @dp.message(Command("channels"))
 async def channels_cmd(message: types.Message):
-    lines = [f"• {CHANNEL_NAMES.get(ch, ch)}" for ch in CHANNELS]
-    await message.answer("📡 Каналы:\n\n" + "\n".join(lines))
+    lines = [f"• <a href='https://t.me/{ch}'>{CHANNEL_NAMES.get(ch, ch)}</a>" for ch in CHANNELS]
+    await message.answer("📡 <b>Каналы:</b>\n\n" + "\n".join(lines), parse_mode="HTML")
 
 @dp.message(Command("stats"))
 async def stats_cmd(message: types.Message):
-    total_posts = 0
-    conn = sqlite3.connect('bot_data.db')
-    c = conn.cursor()
-    today_str = datetime.now(pytz.timezone('Asia/Yekaterinburg')).strftime("%Y-%m-%d")
-    c.execute("SELECT COUNT(*) FROM sent_posts WHERE sent_at LIKE ?", (today_str + '%',))
-    total_posts = c.fetchone()[0]
-    conn.close()
-    await message.answer(f"📊 <b>Статистика за сегодня</b>\n\nВсего постов: {total_posts}", parse_mode="HTML")
+    stats = get_today_stats()
+    if not stats:
+        await message.answer("📊 За сегодня пока нет ни одного отправленного поста.", parse_mode="HTML")
+        return
+    text = "📊 <b>Статистика за сегодня</b>\n\n"
+    total = 0
+    for ch, count in stats.items():
+        name = CHANNEL_NAMES.get(ch, ch)
+        text += f"• {name}: {count} пост(ов)\n"
+        total += count
+    text += f"\n<b>Всего постов: {total}</b>"
+    await message.answer(text, parse_mode="HTML")
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("rewrite_"))
-async def rewrite_callback(callback: CallbackQuery):
-    post_id = callback.data.split("_", 1)[1]
-    await callback.answer("🔄 Переписываю...")
-    await callback.message.answer("⏸️ Функция преобразования временно отключена", parse_mode="HTML")
+# ========== ЭХО-ОТВЕТ НА СООБЩЕНИЯ ПОЛЬЗОВАТЕЛЯ ==========
+@dp.message()
+async def echo_user_message(message: types.Message):
+    if message.from_user.id in waiting_for:
+        return
+    
+    user_text = message.text or message.caption or ""
+    caption = user_text + get_links() if user_text else get_links().strip()
+    
+    file_id = None
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    
+    callback_id = user_cache.add(user_text, file_id)
+    
+    if message.photo:
+        await message.answer_photo(
+            photo=file_id,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Преобразовать", callback_data=f"rewrite_user_{callback_id}")]])
+        )
+    else:
+        await message.answer(
+            text=caption,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Преобразовать", callback_data=f"rewrite_user_{callback_id}")]])
+        )
+
+# ========== КНОПКИ УПРАВЛЕНИЯ КАНАЛАМИ ==========
+waiting_for = {}
+
+@dp.callback_query(lambda c: c.data == "add_channel")
+async def add_channel_callback(callback: CallbackQuery):
+    waiting_for[callback.from_user.id] = "add"
+    await callback.message.answer("Отправьте username канала (без @):")
     await callback.answer()
 
-async def background_checker():
-    while True:
-        if parsing_enabled:
-            cleanup_old_posts()
-            console_print(f"🔍 Проверка {len(CHANNELS)} каналов...")
-            tasks = [check_channel(ch) for ch in CHANNELS]
-            await asyncio.gather(*tasks)
-            console_print(f"💤 Пауза {CHECK_INTERVAL_SECONDS // 60} минут...")
-        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+@dp.callback_query(lambda c: c.data == "del_channel")
+async def del_channel_callback(callback: CallbackQuery):
+    waiting_for[callback.from_user.id] = "del"
+    await callback.message.answer("Отправьте username канала для удаления:")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("rewrite_user_"))
+async def rewrite_user_callback(callback: CallbackQuery):
+    key = callback.data.replace("rewrite_user_", "")
+    original_text, file_id = user_cache.get(key)
+    if not original_text:
+        await callback.answer("❌ Текст не найден", show_alert=True)
+        return
+    await callback.answer("🔄 Переписываю...")
+    new_text = await rewrite_post(original_text)
+    if file_id:
+        await callback.message.answer_photo(photo=file_id, caption=new_text, parse_mode="HTML")
+    else:
+        await callback.message.answer(new_text, parse_mode="HTML")
+    user_cache.remove(key)
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("rewrite_") and not c.data.startswith("rewrite_user_"))
+async def rewrite_parsed_callback(callback: CallbackQuery):
+    post_id = callback.data.split("_", 1)[1]
+    # Здесь нужно получить текст поста из базы, но для упрощения оставим
+    await callback.answer("🔄 Переписываю...")
+    await callback.message.answer("⏸️ Текст поста не сохранён для преобразования", parse_mode="HTML")
+    await callback.answer()
+
+@dp.message()
+async def handle_channel_input(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in waiting_for:
+        return
+    action = waiting_for.pop(user_id)
+    username = message.text.strip().lower()
+    if not username:
+        await message.answer("❌ Не распознано.")
+        return
+    if action == "add":
+        if username in CHANNELS:
+            await message.answer(f"❌ @{username} уже есть.")
+        else:
+            CHANNELS.append(username)
+            CHANNEL_NAMES[username] = username
+            await message.answer(f"✅ @{username} добавлен. Всего: {len(CHANNELS)}")
+    else:
+        if username not in CHANNELS:
+            await message.answer(f"❌ @{username} не найден.")
+        else:
+            CHANNELS.remove(username)
+            CHANNEL_NAMES.pop(username, None)
+            await message.answer(f"✅ @{username} удалён. Осталось: {len(CHANNELS)}")
 
 async def on_startup():
     console_print("=" * 50)
     console_print("🤖 БОТ ЗАПУЩЕН")
     console_print(f"📡 Каналов: {len(CHANNELS)}")
-    console_print(f"🕒 Окно: {WINDOW_MINUTES} минут")
-    console_print(f"⏱ Интервал: {CHECK_INTERVAL_SECONDS // 60} минут")
+    console_print(f"⏱ Проверка каждые {CHECK_INTERVAL_SECONDS} сек")
+    console_print(f"🕒 Посты за последние {WINDOW_MINUTES} минут")
     console_print("=" * 50)
     asyncio.create_task(background_checker())
 
@@ -404,7 +532,6 @@ async def main():
     await on_startup()
     
     if IS_PRODUCTION:
-        # На хостинге используем вебхуки
         app = web.Application()
         app.router.add_post('/webhook', lambda request: dp.feed_update(bot, request))
         runner = web.AppRunner(app)
@@ -412,14 +539,14 @@ async def main():
         site = web.TCPSite(runner, '0.0.0.0', 8080)
         await site.start()
         
-        webhook_url = f"https://{os.environ.get('BOTHOST_HOSTNAME', os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'localhost'))}/webhook"
+        hostname = os.environ.get('BOTHOST_HOSTNAME') or os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'localhost')
+        webhook_url = f"https://{hostname}/webhook"
         await bot.set_webhook(webhook_url)
-        console_print(f"🌐 Вебхук установлен: {webhook_url}")
+        console_print(f"🌐 Вебхук: {webhook_url}")
         
         await asyncio.Event().wait()
     else:
-        # Локально используем поллинг
-        console_print("📍 Запуск в режиме поллинга (локальная разработка)")
+        console_print("📍 Режим поллинга")
         await dp.start_polling(bot)
 
 if __name__ == "__main__":
