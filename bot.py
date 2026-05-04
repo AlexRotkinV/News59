@@ -32,9 +32,8 @@ if not GROQ_API_KEY:
 if not YOUR_CHAT_ID:
     raise ValueError("❌ YOUR_CHAT_ID не задан!")
 
-# Ключевые настройки
-CHECK_INTERVAL_SECONDS = 60    # ← проверка каждые 60 секунд
-WINDOW_MINUTES = 10            # посты за последние 10 минут
+CHECK_INTERVAL_SECONDS = 60
+WINDOW_MINUTES = 10
 POSTS_FETCH_LIMIT = 30
 MAX_CONCURRENT_CHECKS = 3
 MAX_RETRIES = 2
@@ -45,7 +44,6 @@ IS_PRODUCTION = bool(os.environ.get('RENDER_EXTERNAL_HOSTNAME') or os.environ.ge
 groq_client = Groq(api_key=GROQ_API_KEY)
 USE_AI = True
 
-# Список каналов
 CHANNELS = [
     "minterbez_permkrai", "mud_no", "tass_agency", "mod_russia", "radarrussiia",
     "minprosrf", "permvkurse", "newskompanion", "uranews", "favt_info",
@@ -95,23 +93,15 @@ def init_db():
                  (channel TEXT, post_id TEXT, sent_at TIMESTAMP,
                  PRIMARY KEY (channel, post_id))''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_sent_at ON sent_posts (sent_at)')
-    c.execute('''CREATE TABLE IF NOT EXISTS daily_stats
-                 (date TEXT, channel TEXT, count INTEGER,
-                 PRIMARY KEY (date, channel))''')
     conn.commit()
     conn.close()
 
 def mark_as_sent(channel: str, post_id: str):
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
-    now_perm = datetime.now(pytz.timezone('Asia/Yekaterinburg'))
-    now_str = now_perm.isoformat()
-    today_str = now_perm.strftime("%Y-%m-%d")
-    
+    now = datetime.now(pytz.timezone('Asia/Yekaterinburg')).isoformat()
     c.execute("INSERT OR REPLACE INTO sent_posts (channel, post_id, sent_at) VALUES (?, ?, ?)",
-              (channel, post_id, now_str))
-    c.execute("INSERT OR REPLACE INTO daily_stats (date, channel, count) VALUES (?, ?, COALESCE((SELECT count FROM daily_stats WHERE date = ? AND channel = ?), 0) + 1)",
-              (today_str, channel, today_str, channel))
+              (channel, post_id, now))
     conn.commit()
     conn.close()
 
@@ -138,18 +128,22 @@ def get_today_stats():
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
     today_str = datetime.now(pytz.timezone('Asia/Yekaterinburg')).strftime("%Y-%m-%d")
-    c.execute("SELECT channel, count FROM daily_stats WHERE date = ? ORDER BY count DESC", (today_str,))
-    result = c.fetchall()
+    c.execute("SELECT channel, COUNT(*) FROM sent_posts WHERE DATE(sent_at) = ? GROUP BY channel", (today_str,))
+    result = dict(c.fetchall())
     conn.close()
-    return dict(result)
+    return result
 
 init_db()
+
+# ========== КЭШ ДЛЯ ТЕКСТОВ ПОСТОВ (для преобразования) ==========
+posts_cache = {}  # post_id -> text
+user_cache = {}   # user_callback_id -> (text, file_id)
 
 # ========== КОНТРОЛЬ ПАРАЛЛЕЛИЗМА ==========
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
 
 # ========== ЛОГИРОВАНИЕ ==========
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def console_print(msg):
@@ -225,12 +219,7 @@ class GroqRateLimiter:
             return False, max(wait, 1)
         if len(self.day_requests) >= self.max_per_day:
             return False, 3600
-        minute_usage = len(self.minute_requests) / self.max_per_minute
-        if minute_usage > 0.8:
-            delay = self.base_delay * (1 + minute_usage * 2)
-        else:
-            delay = self.base_delay
-        return True, delay
+        return True, self.base_delay
     
     def record_request(self):
         now = datetime.now()
@@ -238,14 +227,14 @@ class GroqRateLimiter:
         self.day_requests.append(now)
 
 rate_limiter = GroqRateLimiter()
-cache = {}
+ai_cache = {}
 
 async def groq_generate_safe(prompt: str, temperature: float = 0.7, max_tokens: int = 600) -> Optional[str]:
     if not USE_AI:
         return None
     cache_key = hashlib.md5(prompt.lower().strip().encode()).hexdigest()
-    if cache_key in cache:
-        return cache[cache_key]
+    if cache_key in ai_cache:
+        return ai_cache[cache_key]
     can_request, delay = rate_limiter.can_make_request()
     if not can_request:
         return None
@@ -262,7 +251,7 @@ async def groq_generate_safe(prompt: str, temperature: float = 0.7, max_tokens: 
     try:
         result = await loop.run_in_executor(None, _sync_generate)
         rate_limiter.record_request()
-        cache[cache_key] = result
+        ai_cache[cache_key] = result
         return result
     except Exception as e:
         console_print(f"❌ Ошибка Groq: {e}")
@@ -288,7 +277,9 @@ async def rate_post_interest(text):
 async def rewrite_post(text):
     if not USE_AI:
         return "❌ Нейросеть не настроена"
-    prompt = f"""Перепиши новость в стиле пермских пабликов (коротко, 1-3 эмодзи, без выдумок):\n\n{text[:500]}"""
+    prompt = f"""Перепиши новость в стиле пермских пабликов (коротко, 1-3 эмодзи, без выдумок, перефразируй):
+
+{text[:500]}"""
     result = await groq_generate_safe(prompt, temperature=0.8, max_tokens=500)
     if not result:
         return "⏸️ Лимит API"
@@ -336,6 +327,9 @@ async def check_channel(channel: str):
                 text_elem = msg.find('div', class_='tgme_widget_message_text')
                 text = text_elem.get_text(strip=True)[:1000] if text_elem else "📄 Без текста"
                 
+                # Сохраняем текст для преобразования
+                posts_cache[post_id] = text
+                
                 title = CHANNEL_NAMES.get(channel, channel)
                 rating = await rate_post_interest(text)
                 msg_text = f"📢 <b>{title}</b>\n{rating}\n\n{text}\n\n🔗 <a href='https://t.me/{post_id}'>Читать пост</a>"
@@ -359,47 +353,20 @@ async def background_checker():
 bot = None
 dp = Dispatcher()
 parsing_enabled = True
-user_messages_cache = {}
-
-class UserMessageCache:
-    def __init__(self):
-        self.data = {}
-    def add(self, original_text: str, file_id: Optional[str] = None):
-        key = str(uuid.uuid4())
-        self.data[key] = (original_text, file_id)
-        return key
-    def get(self, key: str):
-        return self.data.get(key, (None, None))
-    def remove(self, key: str):
-        if key in self.data:
-            del self.data[key]
-
-user_cache = UserMessageCache()
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
-    global parsing_enabled
-    parsing_enabled = True
     await message.answer(
         f"🤖 <b>Парсер Telegram каналов + Groq</b>\n\n"
         f"📡 Каналов: {len(CHANNELS)}\n"
         f"⏱ Проверка каждые {CHECK_INTERVAL_SECONDS} сек\n"
         f"🕒 Посты за последние {WINDOW_MINUTES} минут\n"
-        f"🧠 Оценка + кнопка «Преобразовать»\n"
-        f"📸 Отправьте текст или фото — бот ответит с кнопкой\n\n"
+        f"🧠 Оценка + кнопка «Преобразовать»\n\n"
         f"<b>Команды:</b>\n"
-        f"/stop — остановить парсинг\n"
-        f"/start — возобновить парсинг\n"
         f"/channels — список каналов\n"
         f"/stats — статистика за сегодня",
         parse_mode="HTML"
     )
-
-@dp.message(Command("stop"))
-async def stop_cmd(message: types.Message):
-    global parsing_enabled
-    parsing_enabled = False
-    await message.answer("⏸ Парсинг остановлен. /start — возобновить.")
 
 @dp.message(Command("channels"))
 async def channels_cmd(message: types.Message):
@@ -434,23 +401,17 @@ async def echo_user_message(message: types.Message):
     if message.photo:
         file_id = message.photo[-1].file_id
     
-    callback_id = user_cache.add(user_text, file_id)
+    callback_id = str(uuid.uuid4())
+    user_cache[callback_id] = (user_text, file_id)
+    
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Преобразовать", callback_data=f"rewrite_user_{callback_id}")]])
     
     if message.photo:
-        await message.answer_photo(
-            photo=file_id,
-            caption=caption,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Преобразовать", callback_data=f"rewrite_user_{callback_id}")]])
-        )
+        await message.answer_photo(photo=file_id, caption=caption, parse_mode="HTML", reply_markup=reply_markup)
     else:
-        await message.answer(
-            text=caption,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Преобразовать", callback_data=f"rewrite_user_{callback_id}")]])
-        )
+        await message.answer(text=caption, parse_mode="HTML", reply_markup=reply_markup)
 
-# ========== КНОПКИ УПРАВЛЕНИЯ КАНАЛАМИ ==========
+# ========== ОБРАБОТКА КНОПОК ==========
 waiting_for = {}
 
 @dp.callback_query(lambda c: c.data == "add_channel")
@@ -467,26 +428,33 @@ async def del_channel_callback(callback: CallbackQuery):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("rewrite_user_"))
 async def rewrite_user_callback(callback: CallbackQuery):
-    key = callback.data.replace("rewrite_user_", "")
-    original_text, file_id = user_cache.get(key)
-    if not original_text:
+    callback_id = callback.data.replace("rewrite_user_", "")
+    if callback_id not in user_cache:
         await callback.answer("❌ Текст не найден", show_alert=True)
+        return
+    original_text, file_id = user_cache[callback_id]
+    if not original_text:
+        await callback.answer("❌ Нет текста для преобразования", show_alert=True)
         return
     await callback.answer("🔄 Переписываю...")
     new_text = await rewrite_post(original_text)
     if file_id:
-        await callback.message.answer_photo(photo=file_id, caption=new_text, parse_mode="HTML")
+        await callback.message.answer_photo(photo=file_id, caption=new_text, parse_mode="HTML", disable_web_page_preview=True)
     else:
-        await callback.message.answer(new_text, parse_mode="HTML")
-    user_cache.remove(key)
+        await callback.message.answer(new_text, parse_mode="HTML", disable_web_page_preview=True)
+    del user_cache[callback_id]
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("rewrite_") and not c.data.startswith("rewrite_user_"))
 async def rewrite_parsed_callback(callback: CallbackQuery):
-    post_id = callback.data.split("_", 1)[1]
-    # Здесь нужно получить текст поста из базы, но для упрощения оставим
+    post_id = callback.data.replace("rewrite_", "")
+    if post_id not in posts_cache:
+        await callback.answer("❌ Текст поста не найден", show_alert=True)
+        return
+    original_text = posts_cache[post_id]
     await callback.answer("🔄 Переписываю...")
-    await callback.message.answer("⏸️ Текст поста не сохранён для преобразования", parse_mode="HTML")
+    new_text = await rewrite_post(original_text)
+    await callback.message.answer(new_text, parse_mode="HTML", disable_web_page_preview=True)
     await callback.answer()
 
 @dp.message()
@@ -501,7 +469,7 @@ async def handle_channel_input(message: types.Message):
         return
     if action == "add":
         if username in CHANNELS:
-            await message.answer(f"❌ @{username} уже есть.")
+            await message.answer(f"❌ Канал @{username} уже есть.")
         else:
             CHANNELS.append(username)
             CHANNEL_NAMES[username] = username
@@ -514,6 +482,7 @@ async def handle_channel_input(message: types.Message):
             CHANNEL_NAMES.pop(username, None)
             await message.answer(f"✅ @{username} удалён. Осталось: {len(CHANNELS)}")
 
+# ========== ЗАПУСК ==========
 async def on_startup():
     console_print("=" * 50)
     console_print("🤖 БОТ ЗАПУЩЕН")
