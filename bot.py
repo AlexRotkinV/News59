@@ -135,9 +135,9 @@ def get_today_stats():
 
 init_db()
 
-# ========== КЭШ ДЛЯ ТЕКСТОВ ПОСТОВ (для преобразования) ==========
-posts_cache = {}  # post_id -> text
-user_cache = {}   # user_callback_id -> (text, file_id)
+# ========== КЭШ ДЛЯ ТЕКСТОВ ПОСТОВ ==========
+posts_cache = {}
+user_cache = {}
 
 # ========== КОНТРОЛЬ ПАРАЛЛЕЛИЗМА ==========
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
@@ -327,7 +327,6 @@ async def check_channel(channel: str):
                 text_elem = msg.find('div', class_='tgme_widget_message_text')
                 text = text_elem.get_text(strip=True)[:1000] if text_elem else "📄 Без текста"
                 
-                # Сохраняем текст для преобразования
                 posts_cache[post_id] = text
                 
                 title = CHANNEL_NAMES.get(channel, channel)
@@ -409,7 +408,7 @@ async def echo_user_message(message: types.Message):
     if message.photo:
         await message.answer_photo(photo=file_id, caption=caption, parse_mode="HTML", reply_markup=reply_markup)
     else:
-        await message.answer(text=caption, parse_mode="HTML", reply_markup=reply_markup)
+        await message.answer(text=caption, parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=True)
 
 # ========== ОБРАБОТКА КНОПОК ==========
 waiting_for = {}
